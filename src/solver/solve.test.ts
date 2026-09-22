@@ -140,7 +140,9 @@ function randomInput(rng: () => number, n: number, span: number): AuditInput {
   const set = new Set<number>();
   while (set.size < n) set.add(Math.floor(rng() * span));
   const times = [...set].sort((a, b) => a - b);
-  const priPool = [2, 3, 5, 7, 11];
+  // 含合数重频：2/4、3/6、2/6 等因子关系才可能让“相邻边两两兼容、
+  // 整条序列却无共同重频”的松弛错误暴露出来
+  const priPool = [2, 3, 4, 5, 6, 7, 8, 11, 12];
   const priCount = 1 + Math.floor(rng() * 3);
   const pris: number[] = [];
   while (pris.length < priCount) {
@@ -283,6 +285,108 @@ describe('audit：定向用例', () => {
     expect(info.outgoing).toEqual([1, 1, 1, 1, 1, 0]);
     expect(info.incoming).toEqual([0, 1, 1, 1, 1, 1]);
     expect(info.total).toEqual([1, 2, 2, 2, 2, 1]);
+  });
+});
+
+/* ---------------- 回归：整条序列必须共用同一候选重频 ---------------- */
+
+describe('audit：同序列同重频（审计页场景回归）', () => {
+  // 审计页场景：0/6/18/26 与 100/106/118/126 两组脉冲，候选重频 2/3/4/6/8/12，漏发上限 2。
+  // 组内相邻时差为 6、12、8：没有任何单一候选重频能整除全部三段（6∤8），
+  // 因此每组四脉冲无法连成一条序列；曾出现的缺陷是把每组错误连成重频 6 的序列
+  // （汇总 2 条序列、漏发 4，明细出现 8/6−1 的分数漏发）。
+  const PRIS = [2, 3, 4, 6, 8, 12];
+  const MAX_MISSED = 2;
+  const DELTAS = [0, 6, 18, 26];
+  const groupAt = (start: number): number[] => DELTAS.map((d) => d + start);
+  const EXPECTED: PulseSequence[] = [
+    { pri: 6, members: [0, 1] },
+    { pri: 8, members: [2, 3] },
+    { pri: 6, members: [4, 5] },
+    { pri: 8, members: [6, 7] },
+  ];
+
+  /**
+   * 逐段复算每条返回序列：每个脉冲恰好归属一次；每段相邻时差都是该序列
+   * 重频的整数倍、漏发数是不超上限的非负整数；各段漏发之和等于汇总值。
+   */
+  const expectConsistentSequences = (
+    times: number[],
+    sequences: PulseSequence[],
+    totalMissed: number,
+  ): void => {
+    const covered = new Array<boolean>(times.length).fill(false);
+    let sum = 0;
+    for (const seq of sequences) {
+      expect(PRIS).toContain(seq.pri);
+      expect(seq.members.length).toBeGreaterThanOrEqual(2);
+      for (let k = 1; k < seq.members.length; k++) {
+        const d = times[seq.members[k]] - times[seq.members[k - 1]];
+        expect(d % seq.pri).toBe(0);
+        const missed = d / seq.pri - 1;
+        expect(Number.isInteger(missed)).toBe(true);
+        expect(missed).toBeGreaterThanOrEqual(0);
+        expect(missed).toBeLessThanOrEqual(MAX_MISSED);
+        sum += missed;
+      }
+      for (const m of seq.members) {
+        expect(covered[m]).toBe(false);
+        covered[m] = true;
+      }
+    }
+    expect(covered.every(Boolean)).toBe(true);
+    expect(sum).toBe(totalMissed);
+  };
+
+  it('审计页场景：4 条序列、漏发总数 0、唯一解、规范解确定', () => {
+    const times = [...groupAt(0), ...groupAt(100)];
+    expect(times).toEqual([0, 6, 18, 26, 100, 106, 118, 126]);
+    const outcome = audit({ times, pris: PRIS, maxMissed: MAX_MISSED });
+    expect(outcome.kind).toBe('solved');
+    if (outcome.kind !== 'solved') return;
+    expect(outcome.sequenceCount).toBe(4);
+    expect(outcome.totalMissed).toBe(0);
+    expect(outcome.hasMultiple).toBe(false);
+    expect(outcome.sequences).toEqual(EXPECTED);
+    expectConsistentSequences(times, outcome.sequences, outcome.totalMissed);
+  });
+
+  it.each([
+    { label: '整体平移 1000 µs', starts: [1000, 1100] },
+    { label: '两组各自平移、组间距改变', starts: [40, 960] },
+    { label: '大时刻平移 500000 µs', starts: [500000, 500100] },
+  ])('平移等价脉冲组（$label）：结果与原始场景完全一致', ({ starts }) => {
+    const times = [...groupAt(starts[0]), ...groupAt(starts[1])];
+    const outcome = audit({ times, pris: PRIS, maxMissed: MAX_MISSED });
+    expect(outcome.kind).toBe('solved');
+    if (outcome.kind !== 'solved') return;
+    expect(outcome.sequenceCount).toBe(4);
+    expect(outcome.totalMissed).toBe(0);
+    expect(outcome.hasMultiple).toBe(false);
+    expect(outcome.sequences).toEqual(EXPECTED);
+    expectConsistentSequences(times, outcome.sequences, outcome.totalMissed);
+  });
+
+  it('序列中途不得切换重频：相邻边仅两两兼容不等于整条序列同重频', () => {
+    // 0→6（可用 2/3/6）、6→18（可用 4/6/12）、18→26（可用 4/8）：
+    // 相邻边两两都有共同重频（6、4），但三段没有共同重频，
+    // 故四脉冲连不成一条序列，合法分组为三条双脉冲序列。
+    const outcome = audit({
+      times: [0, 6, 18, 26, 100, 106],
+      pris: PRIS,
+      maxMissed: MAX_MISSED,
+    });
+    expect(outcome.kind).toBe('solved');
+    if (outcome.kind !== 'solved') return;
+    expect(outcome.sequenceCount).toBe(3);
+    expect(outcome.totalMissed).toBe(0);
+    expect(outcome.hasMultiple).toBe(false);
+    expect(outcome.sequences).toEqual([
+      { pri: 6, members: [0, 1] },
+      { pri: 8, members: [2, 3] },
+      { pri: 6, members: [4, 5] },
+    ]);
+    expectConsistentSequences([0, 6, 18, 26, 100, 106], outcome.sequences, 0);
   });
 });
 
