@@ -136,11 +136,15 @@ function makeRng(seed: number): () => number {
   };
 }
 
-function randomInput(rng: () => number, n: number, span: number): AuditInput {
+function randomInput(
+  rng: () => number,
+  n: number,
+  span: number,
+  priPool: number[] = [2, 3, 5, 7, 11],
+): AuditInput {
   const set = new Set<number>();
   while (set.size < n) set.add(Math.floor(rng() * span));
   const times = [...set].sort((a, b) => a - b);
-  const priPool = [2, 3, 5, 7, 11];
   const priCount = 1 + Math.floor(rng() * 3);
   const pris: number[] = [];
   while (pris.length < priCount) {
@@ -286,6 +290,111 @@ describe('audit：定向用例', () => {
   });
 });
 
+/* ---------------- 验收场景：混合重频一致性 ---------------- */
+
+/**
+ * 逐段复算每条返回序列，并校验整体覆盖：
+ *  - 每个脉冲恰好归属一条序列；
+ *  - 每条序列至少两个脉冲、下标严格递增；
+ *  - 每一段相邻时差都是该序列重频的整数倍，且漏发数（整数）不超上限；
+ *  - 复算出的漏发总数与序列数。
+ */
+function recomputeSequences(
+  times: number[],
+  maxMissed: number,
+  sequences: PulseSequence[],
+): { sequenceCount: number; totalMissed: number } {
+  const covered = new Array<boolean>(times.length).fill(false);
+  let totalMissed = 0;
+  for (const seq of sequences) {
+    expect(seq.members.length).toBeGreaterThanOrEqual(2);
+    for (let k = 0; k < seq.members.length; k++) {
+      const m = seq.members[k];
+      expect(covered[m], `脉冲 #${m} 被重复归属`).toBe(false);
+      covered[m] = true;
+      if (k === 0) continue;
+      expect(seq.members[k]).toBeGreaterThan(seq.members[k - 1]);
+      const d = times[seq.members[k]] - times[seq.members[k - 1]];
+      // 整段必须可由同一重频解释：时差为重频的整数倍
+      expect(d % seq.pri, `序列段时差 ${d} 不是重频 ${seq.pri} 的整数倍`).toBe(0);
+      const steps = d / seq.pri;
+      expect(Number.isInteger(steps)).toBe(true);
+      expect(steps).toBeGreaterThanOrEqual(1);
+      // 漏发数 = steps - 1，必须为不超上限的整数
+      expect(steps - 1, `序列段漏发 ${steps - 1} 超过上限 ${maxMissed}`).toBeLessThanOrEqual(
+        maxMissed,
+      );
+      totalMissed += steps - 1;
+    }
+  }
+  expect(covered.every(Boolean), '存在未归属的脉冲').toBe(true);
+  return { sequenceCount: sequences.length, totalMissed };
+}
+
+describe('audit：验收场景（混合重频 6/8 与公因数候选）', () => {
+  const scenario: AuditInput = {
+    times: [0, 6, 18, 26, 100, 106, 118, 126],
+    pris: [2, 3, 4, 6, 8, 12],
+    maxMissed: 2,
+  };
+  const expectedSequences: PulseSequence[] = [
+    { pri: 6, members: [0, 1] },
+    { pri: 8, members: [2, 3] },
+    { pri: 6, members: [4, 5] },
+    { pri: 8, members: [6, 7] },
+  ];
+
+  it('唯一 4 条序列、漏发 0，规范解与逐段复算一致', () => {
+    const outcome = audit(scenario);
+    expect(outcome.kind).toBe('solved');
+    if (outcome.kind !== 'solved') return;
+    expect(outcome.sequenceCount).toBe(4);
+    expect(outcome.totalMissed).toBe(0);
+    expect(outcome.hasMultiple).toBe(false);
+    expect(outcome.sequences).toEqual(expectedSequences);
+    // 汇总必须与逐段复算结果一致（每条序列整段满足同一重频与漏发上限）
+    const recomputed = recomputeSequences(
+      scenario.times,
+      scenario.maxMissed,
+      outcome.sequences,
+    );
+    expect(recomputed.sequenceCount).toBe(outcome.sequenceCount);
+    expect(recomputed.totalMissed).toBe(outcome.totalMissed);
+    // 与暴力枚举对照：最优值、唯一性与规范解一致
+    const brute = bruteForce(scenario.times, scenario.pris, scenario.maxMissed);
+    expect(brute).not.toBeNull();
+    expect(brute!.sequenceCount).toBe(outcome.sequenceCount);
+    expect(brute!.totalMissed).toBe(outcome.totalMissed);
+    expect(brute!.optimalCount >= 2).toBe(outcome.hasMultiple);
+    expect(brute!.canonical).toEqual(outcome.sequences);
+  });
+
+  it.each([1, 7, 500, 10000])('平移 %d µs 后的等价脉冲组结果完全一致', (shift) => {
+    const shifted: AuditInput = {
+      ...scenario,
+      times: scenario.times.map((t) => t + shift),
+    };
+    const outcome = audit(shifted);
+    expect(outcome.kind).toBe('solved');
+    if (outcome.kind !== 'solved') return;
+    expect(outcome.sequenceCount).toBe(4);
+    expect(outcome.totalMissed).toBe(0);
+    expect(outcome.hasMultiple).toBe(false);
+    // 规范解按脉冲下标表示，平移后应逐条相同
+    expect(outcome.sequences).toEqual(expectedSequences);
+    const recomputed = recomputeSequences(
+      shifted.times,
+      shifted.maxMissed,
+      outcome.sequences,
+    );
+    expect(recomputed.sequenceCount).toBe(outcome.sequenceCount);
+    expect(recomputed.totalMissed).toBe(outcome.totalMissed);
+    const brute = bruteForce(shifted.times, shifted.pris, shifted.maxMissed);
+    expect(brute).not.toBeNull();
+    expect(brute!.canonical).toEqual(outcome.sequences);
+  });
+});
+
 /* ---------------- 暴力对照 ---------------- */
 
 describe('audit：与暴力枚举对照', () => {
@@ -306,6 +415,35 @@ describe('audit：与暴力枚举对照', () => {
       expect(outcome.totalMissed, `用例 ${t} 漏发总数`).toBe(brute.totalMissed);
       expect(outcome.hasMultiple, `用例 ${t} 多解判定`).toBe(brute.optimalCount >= 2);
       expect(outcome.sequences, `用例 ${t} 规范解`).toEqual(brute.canonical);
+    }
+  });
+
+  it('300 组含公因数重频池的随机用例与暴力枚举一致', () => {
+    // 重频池含公因数（2|4|6|8|12、3|6|12），同一条时差可被多个重频解释，
+    // 专门回归“同一序列不同边混用重频”的缺陷
+    const rng = makeRng(20260922);
+    for (let t = 0; t < 300; t++) {
+      const n = 6 + Math.floor(rng() * 4); // 6–9
+      const input = randomInput(rng, n, 8 * n, [2, 3, 4, 6, 8, 12]);
+      const brute = bruteForce(input.times, input.pris, input.maxMissed);
+      const outcome = audit(input);
+      if (brute === null) {
+        expect(outcome.kind, `用例 ${t} 应为无解`).toBe('no-solution');
+        continue;
+      }
+      expect(outcome.kind, `用例 ${t} 应有解`).toBe('solved');
+      if (outcome.kind !== 'solved') continue;
+      expect(outcome.sequenceCount, `用例 ${t} 序列数`).toBe(brute.sequenceCount);
+      expect(outcome.totalMissed, `用例 ${t} 漏发总数`).toBe(brute.totalMissed);
+      expect(outcome.hasMultiple, `用例 ${t} 多解判定`).toBe(brute.optimalCount >= 2);
+      expect(outcome.sequences, `用例 ${t} 规范解`).toEqual(brute.canonical);
+      // 逐段复算：整条序列始终满足同一候选重频及漏发上限
+      const recomputed = recomputeSequences(
+        input.times,
+        input.maxMissed,
+        outcome.sequences,
+      );
+      expect(recomputed.totalMissed, `用例 ${t} 复算漏发`).toBe(outcome.totalMissed);
     }
   });
 

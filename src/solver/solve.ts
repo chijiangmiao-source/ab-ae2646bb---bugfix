@@ -23,6 +23,9 @@ import type {
  * 实现：按顶点下标顺序做分支限界深度搜索。
  *  - 处理到顶点 i 时，其入边已确定；若 i 没有入边，则它必须作为新序列的起点
  *    选择一条出边，否则成为孤立脉冲（非法）；
+ *  - 序列的第一条边同时为整条序列选定一个重频 q（按 q 分支），之后该序列的
+ *    每一条出边都必须以同一 q 解释，漏发代价按 q 精确累计——同一条序列绝不
+ *    允许不同边使用不同重频；
  *  - 若 i 已有重频为 q 的入边，则其出边必须沿用 q（同序列同重频），或结束序列。
  * 剪枝：
  *  - 边上界：剩余可连边数 ≤ min(未决定顶点数, 空闲入槽数)，且总边数 ≤ n − 1；
@@ -33,29 +36,12 @@ import type {
 interface Edge {
   /** 后继顶点（在搜索顶点集中的局部下标）。 */
   to: number;
-  /** 重频标签。 */
+  /** 该边最便宜选项的重频（仅用于出边排序的启发）。 */
   pri: number;
-  /** 漏发代价 k - 1。 */
+  /** 该边最便宜选项的漏发代价（仅用于出边排序的启发）。 */
   cost: number;
+  /** 全部可解释该边的（重频, 代价）选项，按代价、重频升序。 */
   options: Array<{ pri: number; cost: number }>;
-}
-
-function cheapestOption(
-  edge: Edge,
-  allowed?: readonly number[],
-): { pri: number; cost: number } | null {
-  let best: { pri: number; cost: number } | null = null;
-  for (const option of edge.options) {
-    if (allowed && !allowed.includes(option.pri)) continue;
-    if (
-      best === null ||
-      option.cost < best.cost ||
-      (option.cost === best.cost && option.pri < best.pri)
-    ) {
-      best = option;
-    }
-  }
-  return best;
 }
 
 /**
@@ -104,7 +90,8 @@ class CoverSearch {
   private readonly out: Edge[][];
   private readonly maxPred: number[];
   private readonly inFrom: Int32Array;
-  private readonly inOptions: Array<number[] | null>;
+  /** 顶点所属序列已确定的重频（仅当 inFrom[i] !== -1 时有效）。 */
+  private readonly inPri: Int32Array;
   private inAssigned = 0;
 
   constructor(
@@ -118,7 +105,7 @@ class CoverSearch {
     this.out = out;
     this.maxPred = maxPred;
     this.inFrom = new Int32Array(this.m).fill(-1);
-    this.inOptions = new Array<number[] | null>(this.m).fill(null);
+    this.inPri = new Int32Array(this.m).fill(-1);
   }
 
   /** 存在既无入边也无出边的顶点时，必然无法全覆盖。 */
@@ -164,15 +151,15 @@ class CoverSearch {
     return Math.min(ub, this.m - 1);
   }
 
-  private take(i: number, e: Edge): void {
+  private take(i: number, e: Edge, pri: number): void {
     this.inFrom[e.to] = i;
-    this.inOptions[e.to] = e.options.map((option) => option.pri);
+    this.inPri[e.to] = pri;
     this.inAssigned++;
   }
 
   private untake(_i: number, e: Edge): void {
     this.inFrom[e.to] = -1;
-    this.inOptions[e.to] = null;
+    this.inPri[e.to] = -1;
     this.inAssigned--;
   }
 
@@ -182,6 +169,7 @@ class CoverSearch {
    *  - onLeaf(e, c)：到达一个完整分组时调用，返回 true 表示提前终止整个遍历。
    * 分支顺序：优先尝试延续当前序列（更快收敛到高边数解，使上界剪枝尽早生效），
    * 其次才结束序列；新序列起点的出边按（代价、终点、重频）升序尝试。
+   * 同一序列的重频在第一条边处选定后固定，代价按该重频精确累计。
    */
   private walk(
     shouldCut: (i: number, e: number, c: number) => boolean,
@@ -192,24 +180,26 @@ class CoverSearch {
       if (shouldCut(i, e, c)) return false;
       if (!this.viable(i)) return false;
       if (this.inFrom[i] === -1) {
-        // i 必须作为新序列起点，选择一条出边
+        // i 必须作为新序列起点：选择一条出边，并为整条序列选定一个重频
         for (const ed of this.out[i]) {
           if (this.inFrom[ed.to] !== -1) continue;
-          this.take(i, ed);
-          const stop = dfs(i + 1, e + 1, c + ed.cost);
-          this.untake(i, ed);
-          if (stop) return true;
+          for (const option of ed.options) {
+            this.take(i, ed, option.pri);
+            const stop = dfs(i + 1, e + 1, c + option.cost);
+            this.untake(i, ed);
+            if (stop) return true;
+          }
         }
         return false;
       }
-      // 优先以同一重频延续当前序列
-      const incomingOptions = this.inOptions[i] ?? [];
+      // 优先以同一重频延续当前序列：出边必须能用 inPri[i] 解释
+      const q = this.inPri[i];
       for (const ed of this.out[i]) {
         if (this.inFrom[ed.to] !== -1) continue;
-        const choice = cheapestOption(ed, incomingOptions);
-        if (!choice) continue;
-        this.take(i, ed);
-        const stop = dfs(i + 1, e + 1, c + choice.cost);
+        const option = ed.options.find((o) => o.pri === q);
+        if (!option) continue;
+        this.take(i, ed, q);
+        const stop = dfs(i + 1, e + 1, c + option.cost);
         this.untake(i, ed);
         if (stop) return true;
       }
@@ -361,22 +351,21 @@ function canonicalSolution(
   const { out } = buildEdges(times, pris, maxMissed);
   const covered = new Array<boolean>(n).fill(false);
   const priList = [...new Set(pris)].sort((a, b) => a - b);
+  const kMax = maxMissed + 1;
   const sequences: PulseSequence[] = [];
   let eUsed = 0;
   let cUsed = 0;
 
-  const relaxedChainCost = (chain: number[], p: number): number => {
+  /**
+   * 序列 chain 在固定重频 p 下的精确漏发数：Σ(相邻时差 / p − 1)。
+   * 任一段时差不是 p 的整数倍或漏发超上限时返回 Infinity（该链不可能属于合法解）。
+   */
+  const chainCost = (chain: number[], p: number): number => {
     let total = 0;
-    let incomingOptions: readonly number[] | null = null;
     for (let i = 1; i < chain.length; i++) {
-      const edge = out[chain[i - 1]].find((candidate) => candidate.to === chain[i]);
-      if (!edge) return Number.POSITIVE_INFINITY;
-      const choice = incomingOptions
-        ? cheapestOption(edge, incomingOptions)
-        : edge.options.find((option) => option.pri === p) ?? null;
-      if (!choice) return Number.POSITIVE_INFINITY;
-      total += choice.cost;
-      incomingOptions = edge.options.map((option) => option.pri);
+      const d = times[chain[i]] - times[chain[i - 1]];
+      if (d % p !== 0 || d / p > kMax) return Number.POSITIVE_INFINITY;
+      total += d / p - 1;
     }
     return total;
   };
@@ -388,9 +377,9 @@ function canonicalSolution(
     for (let v = 0; v < n; v++) {
       if (!covered[v] && !inChain.has(v)) rest.push(v);
     }
-    const chainCost = relaxedChainCost(chain, p);
+    const cost = chainCost(chain, p);
     const restE = E - eUsed - (chain.length - 1);
-    const restC = C - cUsed - chainCost;
+    const restC = C - cUsed - cost;
     if (restE < 0 || restC < 0) return false;
     const sub = new CoverSearch(times, pris, maxMissed, rest);
     return sub.existsExact(restE, restC);
@@ -400,19 +389,13 @@ function canonicalSolution(
   const extend = (chain: number[], p: number): number[] | null => {
     if (chain.length >= 2 && feasibleWith(chain, p)) return [...chain];
     const last = chain[chain.length - 1];
-    const incomingOptions =
-      chain.length >= 2
-        ? out[chain[chain.length - 2]]
-            .find((candidate) => candidate.to === last)
-            ?.options.map((option) => option.pri) ?? []
-        : null;
-    // 同一重频下，出边按代价升序即按终点下标升序（d = k·p 单调）
-    for (const ed of out[last]) {
-      if (covered[ed.to]) continue;
-      const choice = incomingOptions
-        ? cheapestOption(ed, incomingOptions)
-        : ed.options.find((option) => option.pri === p) ?? null;
-      if (!choice) continue;
+    // 同一重频 p 下按终点下标升序延长（字典序）；出边必须能以 p 解释
+    const extensions = out[last]
+      .filter(
+        (ed) => !covered[ed.to] && ed.options.some((option) => option.pri === p),
+      )
+      .sort((a, b) => a.to - b.to);
+    for (const ed of extensions) {
       const r = extend([...chain, ed.to], p);
       if (r) return r;
     }
@@ -442,7 +425,7 @@ function canonicalSolution(
     }
     sequences.push(chosen);
     eUsed += chosen.members.length - 1;
-    const chosenCost = relaxedChainCost(chosen.members, chosen.pri);
+    const chosenCost = chainCost(chosen.members, chosen.pri);
     cUsed += Number.isFinite(chosenCost) ? chosenCost : sequenceMissed(times, chosen);
     for (const v of chosen.members) covered[v] = true;
   }
